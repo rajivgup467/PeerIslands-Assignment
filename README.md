@@ -15,22 +15,8 @@ Developer Push → GitHub Actions Pipeline
         ├── kubectl apply → Deploy Microservices to AKS
         └── Helm install → Prometheus & Grafana monitoring stack
 
-Azure Architecture
- ┌──────────────────────────────────────────────────────────────────────────────┐
- │                                 Azure Cloud                                  │
- │                                                                              │
- │ ┌────────────────────────────┐         ┌──────────────────────────────────┐  │
- │ │ Azure Container Registry   │◄────────│ GitHub Actions (CI/CD Pipeline) │  │
- │ │ - Stores Docker Images     │         │ - Terraform Scan (Checkov)      │  │
- │ └────────────────────────────┘         │ - Docker Build/Push             │  │
- │                                        │ - Terraform Apply               │  │
- │ ┌────────────────────────────┐         │ - kubectl/Helm Deploy           │  │
- │ │ Azure Kubernetes Service   │────────►│ - Prometheus/Grafana Install    │  │
- │ │ - Hosts Frontend & API     │         └──────────────────────────────────┘  │
- │ │ - VNet Integrated, RBAC    │                                                │
- │ │ - Prometheus & Grafana     │                                                │
- │ └────────────────────────────┘                                                │
- └──────────────────────────────────────────────────────────────────────────────┘
+
+ 
 
 # Repository Structure
 project-root/
