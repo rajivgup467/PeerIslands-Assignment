@@ -1,0 +1,187 @@
+name: Build, Scan, and Deploy to AKS
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  TF_WORKING_DIR: ./infrastructure
+  K8S_DIR: ./k8s
+  API_IMAGE_NAME: api
+  FRONTEND_IMAGE_NAME: frontend
+
+jobs:
+  # Step 1: Terraform Security Scan (Checkov)
+  terraform-scan:
+    name: Terraform Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Checkov Scan
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ env.TF_WORKING_DIR }}
+      - name: Upload Scan Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkov-report
+          path: checkov_report*.json
+
+  # Step 2: Build and Push Docker Images to ACR
+  build-and-push:
+    name: Build & Push Images
+    runs-on: ubuntu-latest
+    needs: terraform-scan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Docker Login to ACR
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ secrets.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and Push API Image
+        run: |
+          docker build -t ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.API_IMAGE_NAME }}:latest ./app/api
+          docker push ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.API_IMAGE_NAME }}:latest
+
+      - name: Build and Push Frontend Image
+        run: |
+          docker build -t ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.FRONTEND_IMAGE_NAME }}:latest ./app/frontend
+          docker push ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.FRONTEND_IMAGE_NAME }}:latest
+
+  # Step 3: Terraform Apply (AKS Provisioning)
+  terraform-deploy:
+    name: Terraform Deploy
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    env:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.8.0
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform plan -out=tfplan
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve tfplan
+
+  # Step 4: Deploy Kubernetes Manifests to AKS
+  deploy-k8s:
+    name: Deploy App to AKS
+    runs-on: ubuntu-latest
+    needs: terraform-deploy
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set AKS Context
+        uses: azure/aks-set-context@v3
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          cluster-name: ${{ secrets.AKS_CLUSTER_NAME }}
+          resource-group: ${{ secrets.RESOURCE_GROUP }}
+
+      - name: Get ACR Login Server from Terraform
+        id: tf-acr
+        run: |
+          cd infrastructure
+          ACR_NAME=$(terraform output -raw acr_login_server)
+          echo "acr=$ACR_NAME" >> $GITHUB_OUTPUT
+
+      - name: Replace ACR name in manifests
+        run: |
+          sed -i "s|<your-acr-name>.azurecr.io|${{ steps.tf-acr.outputs.acr }}|g" k8s/deployment-api.yaml
+          sed -i "s|<your-acr-name>.azurecr.io|${{ steps.tf-acr.outputs.acr }}|g" k8s/deployment-frontend.yaml
+          sed -i "s|<yourdomain>|${{ secrets.APP_DOMAIN }}|g" k8s/ingress.yaml
+
+      - name: Deploy App to AKS
+        run: |
+          kubectl apply -f ${{ env.K8S_DIR }}/namespace.yaml
+          kubectl apply -f ${{ env.K8S_DIR }}/deployment-api.yaml
+          kubectl apply -f ${{ env.K8S_DIR }}/service-api.yaml
+          kubectl apply -f ${{ env.K8S_DIR }}/deployment-frontend.yaml
+          kubectl apply -f ${{ env.K8S_DIR }}/service-frontend.yaml
+          kubectl apply -f ${{ env.K8S_DIR }}/ingress.yaml
+
+      - name: Verify Deployment
+        run: |
+          kubectl get pods -n demo-app
+          kubectl get svc -n demo-app
+
+  # Step 5: Install Prometheus & Grafana via Helm
+  install-monitoring:
+    name: Install Prometheus & Grafana
+    runs-on: ubuntu-latest
+    needs: deploy-k8s
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set AKS Context
+        uses: azure/aks-set-context@v3
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          cluster-name: ${{ secrets.AKS_CLUSTER_NAME }}
+          resource-group: ${{ secrets.RESOURCE_GROUP }}
+
+      - name: Install Helm
+        run: |
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - name: Add Helm Repositories
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo add grafana https://grafana.github.io/helm-charts
+          helm repo update
+
+      - name: Create Monitoring Namespace
+        run: |
+          kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Install Prometheus Stack
+        run: |
+          helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
+            --namespace monitoring \
+            --set grafana.enabled=false
+
+      - name: Install Grafana
+        run: |
+          helm upgrade --install grafana grafana/grafana \
+            --namespace monitoring \
+            --set adminUser=admin \
+            --set adminPassword=admin123 \
+            --set service.type=LoadBalancer \
+            --set persistence.enabled=false
+
+      - name: Get Grafana Service Info
+        run: |
+          echo "Grafana will be available at:"
+          kubectl get svc -n monitoring grafana -o wide

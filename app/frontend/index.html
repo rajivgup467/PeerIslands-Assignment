@@ -1,0 +1,13 @@
+<html>
+  <head><title>Frontend</title></head>
+  <body>
+    <h1>Welcome to the Frontend!</h1>
+    <p>Backend API: <span id="api"></span></p>
+    <script>
+      fetch("/api")
+        .then(r => r.json())
+        .then(d => document.getElementById("api").innerText = d.message)
+        .catch(() => document.getElementById("api").innerText = "API unreachable");
+    </script>
+  </body>
+</html>
